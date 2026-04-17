@@ -1,5 +1,11 @@
 # Freebuff2API
 
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![aiohttp](https://img.shields.io/badge/aiohttp-3.9+-green.svg)](https://docs.aiohttp.org/)
+[![Platform](https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-lightgrey.svg)](#)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/buyi06/Freebuff2API/pulls)
+
 将 [Freebuff / Codebuff](https://www.codebuff.com) 的 Agent 接口反向代理成 OpenAI 兼容的 `/v1/chat/completions` API，方便任何支持 OpenAI 协议的客户端（Cherry Studio、Chatbox、LobeChat、OpenWebUI、LangChain、OpenAI SDK 等）直接接入。
 
 ## 特性
@@ -27,7 +33,7 @@
 ## 安装
 
 ```bash
-pip install aiohttp
+pip install -r requirements.txt
 ```
 
 要求 Python ≥ 3.10。
@@ -132,3 +138,7 @@ print(resp.choices[0].message.content)
 ## 免责声明
 
 本项目仅供学习与个人研究。请遵守上游服务条款；因滥用造成的账号或法律风险由使用者自行承担。
+
+## 许可证
+
+[MIT](./LICENSE) © 2026 buyi06
