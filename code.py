@@ -470,6 +470,21 @@ async def stream_to_openai_format(session, freebuff_body, auth_token, response, 
         }
         await response.write(f"data: {json.dumps(pkt)}\n\n".encode())
 
+    async def flush_field_buffer(field, buf, ad_flag):
+        """field 切换时把挂起的 rolling buffer 完整送出（扫一次广告）。
+        返回 (new_buf, new_ad_flag)。用来避免 reasoning 的尾部因为滚动缓冲
+        被晚到的 content 劈成两段，造成视觉上"思维链被正文切断"。"""
+        if not buf:
+            return buf, ad_flag
+        idx = find_ad_index(buf)
+        if idx != -1:
+            safe = buf[:idx].rstrip()
+            if safe:
+                await emit({field: safe})
+            return "", True
+        await emit({field: buf})
+        return "", ad_flag
+
     # 首帧严格对齐 OpenAI 官方格式 {"role":"assistant","content":""}，
     # 保证 OpenAI->Anthropic 适配层能正常触发 message_start，
     # 避免 "Unexpected event order, got message_delta before message_start"
@@ -515,6 +530,16 @@ async def stream_to_openai_format(session, freebuff_body, auth_token, response, 
                         finish_reason = cfr
 
                     c = delta.get("content")
+                    r = delta.get("reasoning_content")
+
+                    # field 切换时先 flush 对方挂起的 buffer，顺序严格按到达顺序交付
+                    if c and not ad_in_content:
+                        reasoning_buffer, ad_in_reasoning = await flush_field_buffer(
+                            "reasoning_content", reasoning_buffer, ad_in_reasoning)
+                    if r and not ad_in_reasoning:
+                        content_buffer, ad_in_content = await flush_field_buffer(
+                            "content", content_buffer, ad_in_content)
+
                     if c and not ad_in_content:
                         content_buffer += c
                         idx = find_ad_index(content_buffer)
@@ -529,7 +554,6 @@ async def stream_to_openai_format(session, freebuff_body, auth_token, response, 
                             await emit({"content": content_buffer[:cut]})
                             content_buffer = content_buffer[cut:]
 
-                    r = delta.get("reasoning_content")
                     if r and not ad_in_reasoning:
                         reasoning_buffer += r
                         idx = find_ad_index(reasoning_buffer)
