@@ -496,7 +496,9 @@ async def stream_to_openai_format(session, freebuff_body, auth_token, response, 
     ad_in_content = False
     ad_in_reasoning = False
 
-    timeout = aiohttp.ClientTimeout(total=120)
+    # 流式不限总时长 (长回复可能几分钟)，但任意连续 60s 没读到字节就判空闲超时；
+    # 原先 total=120 会在稍微长一点的回复中途掐断流，表现为客户端"回一半就失败"。
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=60, connect=10)
     async with session.post(url, json=freebuff_body, headers=headers, timeout=timeout) as resp:
         if resp.status != 200:
             err = await resp.text()
@@ -663,9 +665,10 @@ async def handle_chat_completion(request):
         except (ConnectionResetError, asyncio.CancelledError):
             log.info("客户端断开")
         except Exception as e:
-            log.error("流式失败: %s", e)
+            msg = str(e) or e.__class__.__name__
+            log.error("流式失败: %s", msg)
             try:
-                err_chunk = {"error": {"message": str(e)}}
+                err_chunk = {"error": {"message": msg, "type": e.__class__.__name__}}
                 await response.write(f"data: {json.dumps(err_chunk)}\n\n".encode())
                 await response.write(b"data: [DONE]\n\n")
                 await response.write_eof()
