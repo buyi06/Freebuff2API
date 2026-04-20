@@ -11,8 +11,11 @@
 ## 特性
 
 - OpenAI 兼容：`/v1/chat/completions`、`/v1/models`
-- 支持流式 (SSE) 与非流式
+- 支持流式 (SSE) 与非流式，首帧严格对齐 OpenAI 官方 `{"role":"assistant","content":""}` 格式，兼容 OpenAI → Anthropic 适配层（避免 `message_delta before message_start` 错误）
 - 透传 `tool_calls`、`reasoning_content`（思维链）
+- **自动剥离上游中转注入的推广文案**（`op.wtf` / `api.airforce` / `discord.gg/airforce` 等），流式场景下通过滚动缓冲处理跨 chunk 的广告片段
+- **内置上游速率限制**（多窗口滑动日志），客户端最长排队 30s，超限返回 `429 + Retry-After`
+- 非流式长任务上游超时放宽到 180s，并用 `504 + "Upstream timeout"` 替代原先的空错误体
 - 自动登录 / Token 持久化（首启动走浏览器扫码）
 - Agent Run 缓存与失效自动重建
 - 可选 API Key 鉴权，避免公网裸跑
@@ -41,7 +44,7 @@ pip install -r requirements.txt
 ## 快速开始
 
 ```bash
-python code.py --host 0.0.0.0 --port 1145
+python code.py --host 0.0.0.0 --port 7817
 ```
 
 首次启动如未登录，会输出登录 URL 并尝试打开浏览器，完成登录后回车继续即可，凭据写入：
@@ -74,7 +77,7 @@ api-key:    sk-xxxxxx
 ## 调用示例
 
 ```bash
-curl http://127.0.0.1:1145/v1/chat/completions \
+curl http://127.0.0.1:7817/v1/chat/completions \
   -H "Authorization: Bearer sk-xxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
@@ -89,7 +92,7 @@ OpenAI SDK：
 ```python
 from openai import OpenAI
 client = OpenAI(
-    base_url="http://127.0.0.1:1145/v1",
+    base_url="http://127.0.0.1:7817/v1",
     api_key="sk-xxxxxx",
 )
 resp = client.chat.completions.create(
@@ -108,16 +111,52 @@ print(resp.choices[0].message.content)
 | GET  | `/v1/models` | 模型列表 |
 | POST | `/v1/reset-run` | 清除缓存的 Agent Run，强制下次重建 |
 | POST | `/v1/reload-key` | 用旧 Key 鉴权后，从磁盘/环境重读 API Key |
-| GET  | `/health` | 健康检查 |
+| GET  | `/health` | 健康检查，返回 token/run 状态与各窗口 `rateLimit.used/limit` |
 
 ## 命令行参数
 
 ```
---host         监听地址 (默认 127.0.0.1)
---port         监听端口 (默认 1145)
+--host         监听地址 (默认 0.0.0.0)
+--port         监听端口 (默认 7817)
 --log-level    DEBUG/INFO/WARNING/ERROR
 --log-file     日志文件路径
 --lazy         不预热 Agent Run，首个请求时再创建
+```
+
+## 速率限制
+
+为了不触发上游封禁，代理内置了和上游一致的 5 层滑动窗口限流：
+
+| 窗口 | 上限 |
+|---|---|
+| 1 秒 | 2 |
+| 1 分钟 | 25 |
+| 30 分钟 | 250 |
+| 5 小时 | 2000 |
+| 7 天 | 20000 |
+
+每个 `/v1/chat/completions` 请求消耗 1 个额度，任一窗口超限则排队；客户端最长等待 30 秒，超过则返回：
+
+```json
+{"error": {"message": "Upstream rate limited, retry in 8s.", "type": "rate_limited"}}
+```
+
+并附带 `Retry-After` 响应头。实时用量可通过：
+
+```bash
+curl http://127.0.0.1:7817/health
+```
+
+查看 `rateLimit` 字段：
+
+```json
+"rateLimit": {
+  "1s":      {"used": 0, "limit": 2},
+  "60s":     {"used": 8, "limit": 25},
+  "1800s":   {"used": 8, "limit": 250},
+  "18000s":  {"used": 8, "limit": 2000},
+  "604800s": {"used": 8, "limit": 20000}
+}
 ```
 
 ## 常见问题
