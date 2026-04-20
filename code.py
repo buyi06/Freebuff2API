@@ -27,8 +27,8 @@ except ImportError:
     sys.exit(1)
 
 API_BASE = "www.codebuff.com"
-DEFAULT_PORT = 1145
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 7817
+DEFAULT_HOST = "0.0.0.0"
 POLL_INTERVAL_S = 5
 LOGIN_TIMEOUT_S = 300
 
@@ -167,7 +167,9 @@ async def api_request(session, hostname, path, body=None, auth_token=None, metho
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "freebuff-proxy/1.0",
+        "Accept-Encoding": "identity",
+        "User-Agent": "codebuff-cli/1.0.643",
+        "x-codebuff-cli-version": "1.0.643",
     }
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
@@ -282,7 +284,6 @@ def make_freebuff_body(openai_body, run_id):
     body["codebuff_metadata"] = {
         "run_id": run_id,
         "client_id": f"freebuff-proxy-{''.join(random.choices(string.ascii_lowercase + string.digits, k=8))}",
-        "cost_mode": "free",
     }
     return body
 
@@ -298,11 +299,44 @@ def sanitize_tool_calls(tool_calls):
     ]
 
 
+# 上游 (airforce/op.wtf 类中转) 会在响应末尾追加推广文案，需要统一剥离。
+AD_MARKERS = (
+    "Need proxies cheaper",
+    "Upgrade your plan to remove",
+    "https://op.wtf",
+    "https://api.airforce",
+    "discord.gg/airforce",
+)
+_AD_MAX_LEN = max(len(m) for m in AD_MARKERS)
+
+
+def find_ad_index(text: str) -> int:
+    """返回文本中最早出现的广告标记位置；未命中返回 -1。"""
+    earliest = -1
+    for m in AD_MARKERS:
+        i = text.find(m)
+        if i != -1 and (earliest == -1 or i < earliest):
+            earliest = i
+    return earliest
+
+
+def filter_ads(text):
+    """切掉文本末尾的广告段落。"""
+    if not text or not isinstance(text, str):
+        return text
+    idx = find_ad_index(text)
+    if idx == -1:
+        return text
+    return text[:idx].rstrip()
+
+
 def build_openai_response(run_id, model, choice_data, usage_data=None):
     choice = choice_data or {}
     message = choice.get("message", {})
     has_tool_calls = bool(message.get("tool_calls"))
     finish_reason = choice.get("finish_reason") or ("tool_calls" if has_tool_calls else "stop")
+    content = filter_ads(message.get("content"))
+    reasoning = filter_ads(message.get("reasoning_content"))
     resp = {
         "id": f"freebuff-{run_id}",
         "object": "chat.completion",
@@ -312,9 +346,8 @@ def build_openai_response(run_id, model, choice_data, usage_data=None):
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": message.get("content") if not has_tool_calls else message.get("content"),
-                **({"reasoning_content": message["reasoning_content"]}
-                   if message.get("reasoning_content") else {}),
+                "content": content,
+                **({"reasoning_content": reasoning} if reasoning else {}),
             },
             "finish_reason": finish_reason,
         }],
@@ -326,8 +359,7 @@ def build_openai_response(run_id, model, choice_data, usage_data=None):
     }
     if has_tool_calls:
         resp["choices"][0]["message"]["tool_calls"] = sanitize_tool_calls(message["tool_calls"])
-        if resp["choices"][0]["message"]["content"] is None:
-            pass  # OpenAI 规范允许 null
+        # 带 tool_calls 时 content 允许为 null
     else:
         if resp["choices"][0]["message"]["content"] is None:
             resp["choices"][0]["message"]["content"] = ""
@@ -342,12 +374,39 @@ async def stream_to_openai_format(session, freebuff_body, auth_token, response, 
         "Content-Type": "application/json",
         "Authorization": f"Bearer {auth_token}",
         "Accept": "text/event-stream",
-        "User-Agent": "freebuff-proxy/1.0",
+        "Accept-Encoding": "identity",
+        "User-Agent": "codebuff-cli/1.0.643",
+        "x-codebuff-cli-version": "1.0.643",
+        "x-freebuff-version": "0.0.39",
     }
     response_id = f"freebuff-{int(time.time() * 1000)}"
+    created_ts = int(time.time())
     finish_reason = "stop"
     last_usage = None
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    async def emit(delta_obj):
+        if not delta_obj:
+            return
+        pkt = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta_obj, "finish_reason": None}],
+        }
+        await response.write(f"data: {json.dumps(pkt)}\n\n".encode())
+
+    # 首帧严格对齐 OpenAI 官方格式 {"role":"assistant","content":""}，
+    # 保证 OpenAI->Anthropic 适配层能正常触发 message_start，
+    # 避免 "Unexpected event order, got message_delta before message_start"
+    await emit({"role": "assistant", "content": ""})
+
+    # 广告过滤缓冲：边推边剥离，尾部可能跨 chunk，所以保留 _AD_MAX_LEN 字节待确认
+    content_buffer = ""
+    reasoning_buffer = ""
+    ad_in_content = False
+    ad_in_reasoning = False
 
     timeout = aiohttp.ClientTimeout(total=120)
     async with session.post(url, json=freebuff_body, headers=headers, timeout=timeout) as resp:
@@ -382,32 +441,59 @@ async def stream_to_openai_format(session, freebuff_body, auth_token, response, 
                     if cfr:
                         finish_reason = cfr
 
-                    delta_obj = {}
-                    if "content" in delta and delta["content"] is not None:
-                        delta_obj["content"] = delta["content"]
-                    if "reasoning_content" in delta and delta["reasoning_content"] is not None:
-                        delta_obj["reasoning_content"] = delta["reasoning_content"]
-                    if "tool_calls" in delta and delta["tool_calls"] is not None:
-                        delta_obj["tool_calls"] = sanitize_tool_calls(delta["tool_calls"])
-                    if delta.get("role"):
-                        delta_obj["role"] = delta["role"]
+                    c = delta.get("content")
+                    if c and not ad_in_content:
+                        content_buffer += c
+                        idx = find_ad_index(content_buffer)
+                        if idx != -1:
+                            safe = content_buffer[:idx].rstrip()
+                            if safe:
+                                await emit({"content": safe})
+                            ad_in_content = True
+                            content_buffer = ""
+                        elif len(content_buffer) > _AD_MAX_LEN:
+                            cut = len(content_buffer) - _AD_MAX_LEN
+                            await emit({"content": content_buffer[:cut]})
+                            content_buffer = content_buffer[cut:]
 
-                    if delta_obj:
-                        openai_chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model,
-                            "choices": [{"index": 0, "delta": delta_obj, "finish_reason": None}],
-                        }
-                        await response.write(f"data: {json.dumps(openai_chunk)}\n\n".encode())
+                    r = delta.get("reasoning_content")
+                    if r and not ad_in_reasoning:
+                        reasoning_buffer += r
+                        idx = find_ad_index(reasoning_buffer)
+                        if idx != -1:
+                            safe = reasoning_buffer[:idx].rstrip()
+                            if safe:
+                                await emit({"reasoning_content": safe})
+                            ad_in_reasoning = True
+                            reasoning_buffer = ""
+                        elif len(reasoning_buffer) > _AD_MAX_LEN:
+                            cut = len(reasoning_buffer) - _AD_MAX_LEN
+                            await emit({"reasoning_content": reasoning_buffer[:cut]})
+                            reasoning_buffer = reasoning_buffer[cut:]
+
+                    tc = delta.get("tool_calls")
+                    if tc is not None:
+                        await emit({"tool_calls": sanitize_tool_calls(tc)})
+
                 except Exception as e:
                     log.warning("SSE 处理异常: %s", e)
+
+        # 收尾：剩余缓冲再扫一遍，处理跨边界的广告
+        if content_buffer and not ad_in_content:
+            idx = find_ad_index(content_buffer)
+            tail = content_buffer[:idx].rstrip() if idx != -1 else content_buffer
+            if tail:
+                await emit({"content": tail})
+        if reasoning_buffer and not ad_in_reasoning:
+            idx = find_ad_index(reasoning_buffer)
+            tail = reasoning_buffer[:idx].rstrip() if idx != -1 else reasoning_buffer
+            if tail:
+                await emit({"reasoning_content": tail})
 
         final_chunk = {
             "id": response_id,
             "object": "chat.completion.chunk",
-            "created": int(time.time()),
+            "created": created_ts,
             "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
         }
@@ -429,6 +515,14 @@ async def handle_chat_completion(request):
         body = await request.json()
     except Exception:
         return web.json_response({"error": {"message": "Invalid JSON body"}}, status=400)
+
+    # 修复 tools 中的 parameters 字段
+    if "tools" in body and body["tools"]:
+        for tool in body["tools"]:
+            if tool.get("type") == "function" and "function" in tool:
+                func = tool["function"]
+                if func.get("parameters") is None:
+                    func["parameters"] = {"type": "object", "properties": {}}
 
     model = resolve_model(body.get("model", DEFAULT_MODEL))
     body["model"] = model
