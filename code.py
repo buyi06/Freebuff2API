@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import bisect
 import codecs
 import hmac
 import json
@@ -58,6 +59,7 @@ token: str | None = None
 cached_run_id: str | None = None
 cached_agent_id: str | None = None
 run_lock: asyncio.Lock | None = None
+upstream_limiter: "SlidingWindowLimiter | None" = None
 
 log = logging.getLogger("freebuff")
 
@@ -158,6 +160,77 @@ def require_auth(handler):
             return web.json_response({"error": {"message": "Unauthorized"}}, status=401)
         return await handler(request)
     return wrapper
+
+
+# ============ 速率限制 ============
+
+# 上游限制：2/s, 25/min, 250/30min, 2000/5h, 20000/7d
+UPSTREAM_LIMITS = [
+    (1, 2),
+    (60, 25),
+    (30 * 60, 250),
+    (5 * 3600, 2000),
+    (7 * 86400, 20000),
+]
+
+
+class SlidingWindowLimiter:
+    """多窗口滑动日志限流器。每个请求记录一个时间戳，按窗口内计数判断。"""
+
+    def __init__(self, windows):
+        self.windows = sorted(windows, key=lambda w: w[0])
+        self._max_window = max(w[0] for w in windows)
+        self.log: list[float] = []
+        self._lock = asyncio.Lock()
+
+    def _trim(self, now: float):
+        cutoff = now - self._max_window
+        i = bisect.bisect_left(self.log, cutoff)
+        if i > 0:
+            del self.log[:i]
+
+    def _eta(self, now: float) -> float:
+        """返回下一次 1 个额度可用的等待秒数；0 表示当前可用。"""
+        worst = 0.0
+        for win_s, limit in self.windows:
+            cutoff = now - win_s
+            start = bisect.bisect_right(self.log, cutoff)
+            count = len(self.log) - start
+            if count >= limit:
+                oldest_in_window = self.log[start]
+                wait = oldest_in_window + win_s - now
+                if wait > worst:
+                    worst = wait
+        return worst
+
+    async def acquire(self, max_wait_s: float = 30.0) -> tuple[bool, float]:
+        """消耗一个额度，最长等待 max_wait_s 秒；成功返回 (True, 0)，否则 (False, eta)。"""
+        deadline = time.monotonic() + max_wait_s
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._trim(now)
+                wait = self._eta(now)
+                if wait <= 0:
+                    self.log.append(now)
+                    return True, 0.0
+                if now + wait > deadline:
+                    return False, wait
+            sleep_for = min(wait, max(0.05, deadline - time.monotonic()))
+            if sleep_for <= 0:
+                return False, wait
+            await asyncio.sleep(sleep_for)
+
+    def snapshot(self) -> dict:
+        """返回各窗口当前使用量，供 /health 展示。"""
+        now = time.monotonic()
+        result = {}
+        for win_s, limit in self.windows:
+            cutoff = now - win_s
+            start = bisect.bisect_right(self.log, cutoff)
+            used = len(self.log) - start
+            result[f"{win_s}s"] = {"used": used, "limit": limit}
+        return result
 
 
 # ============ HTTP 请求 ============
@@ -532,6 +605,20 @@ async def handle_chat_completion(request):
     log.info("请求: model=%s agent=%s messages=%d stream=%s",
              model, agent_id, len(body.get("messages", [])), is_stream)
 
+    # 限流：上游 2/s, 25/min, 250/30min, 2000/5h, 20000/7d。
+    # 最多让客户端排队 30 秒；超时返回 429，避免在流式路径触发 mid-SSE 错误。
+    if upstream_limiter is not None:
+        granted, eta = await upstream_limiter.acquire(max_wait_s=30.0)
+        if not granted:
+            retry_after = max(1, int(eta) + 1)
+            log.warning("限流拒绝，eta=%.1fs", eta)
+            return web.json_response(
+                {"error": {"message": f"Upstream rate limited, retry in {retry_after}s.",
+                           "type": "rate_limited"}},
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+
     try:
         run_id = await get_or_create_agent_run(session, token, agent_id)
     except Exception as e:
@@ -640,15 +727,17 @@ async def handle_health(request):
         "cachedRunId": cached_run_id,
         "cachedAgentId": cached_agent_id,
         "apiKeyEnabled": bool(PROXY_API_KEY),
+        "rateLimit": upstream_limiter.snapshot() if upstream_limiter else None,
     })
 
 
 # ============ 主入口 ============
 
 async def run_server(host: str, port: int, lazy_warmup: bool):
-    global token, cached_run_id, cached_agent_id, run_lock
+    global token, cached_run_id, cached_agent_id, run_lock, upstream_limiter
 
     run_lock = asyncio.Lock()
+    upstream_limiter = SlidingWindowLimiter(UPSTREAM_LIMITS)
     token = load_token()
     load_proxy_api_key()
     connector = aiohttp.TCPConnector(limit=64)
