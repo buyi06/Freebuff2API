@@ -162,7 +162,7 @@ def require_auth(handler):
 
 # ============ HTTP 请求 ============
 
-async def api_request(session, hostname, path, body=None, auth_token=None, method="POST"):
+async def api_request(session, hostname, path, body=None, auth_token=None, method="POST", timeout_s: int = 30):
     url = f"https://{hostname}{path}"
     headers = {
         "Content-Type": "application/json",
@@ -174,7 +174,7 @@ async def api_request(session, hostname, path, body=None, auth_token=None, metho
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
 
-    kwargs = {"headers": headers, "timeout": aiohttp.ClientTimeout(total=30)}
+    kwargs = {"headers": headers, "timeout": aiohttp.ClientTimeout(total=timeout_s)}
     if body is not None and method == "POST":
         kwargs["json"] = body
 
@@ -563,7 +563,7 @@ async def handle_chat_completion(request):
         return response
 
     try:
-        res = await api_request(session, API_BASE, "/api/v1/chat/completions", fb_body, token)
+        res = await api_request(session, API_BASE, "/api/v1/chat/completions", fb_body, token, timeout_s=180)
         if res["status"] == 200:
             choice = (res["data"].get("choices") or [{}])[0]
             resp = build_openai_response(run_id, model, choice, res["data"].get("usage"))
@@ -573,7 +573,7 @@ async def handle_chat_completion(request):
             log.warning("Agent Run 失效，重建")
             run_id = await reset_and_create_run(session, token, agent_id)
             fb_body["codebuff_metadata"]["run_id"] = run_id
-            retry = await api_request(session, API_BASE, "/api/v1/chat/completions", fb_body, token)
+            retry = await api_request(session, API_BASE, "/api/v1/chat/completions", fb_body, token, timeout_s=180)
             if retry["status"] == 200:
                 choice = (retry["data"].get("choices") or [{}])[0]
                 resp = build_openai_response(run_id, model, choice, retry["data"].get("usage"))
@@ -581,9 +581,16 @@ async def handle_chat_completion(request):
                 return web.json_response(resp)
             return web.json_response({"error": {"message": retry["data"]}}, status=retry["status"])
         return web.json_response({"error": {"message": res["data"]}}, status=res["status"])
+    except asyncio.TimeoutError:
+        log.warning("非流式上游超时 %dms", int((time.time() - start) * 1000))
+        return web.json_response(
+            {"error": {"message": "Upstream timeout (>180s). 建议改用 stream:true 接收长回复。",
+                       "type": "upstream_timeout"}},
+            status=504,
+        )
     except Exception as e:
         log.exception("请求失败")
-        return web.json_response({"error": {"message": str(e)}}, status=500)
+        return web.json_response({"error": {"message": str(e) or e.__class__.__name__}}, status=500)
 
 
 @require_auth
